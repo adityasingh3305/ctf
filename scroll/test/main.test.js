@@ -133,6 +133,30 @@ describe("RedditScroller utility methods", () => {
     expect(result.hlsSource).toBe("https://example.com/video.m3u8");
   });
 
+  it("uses reddit's highest available mp4 (fallback_url) as the HD source", () => {
+    const data = {
+      title: "HD Video",
+      permalink: "/r/test/comments/999/hd_video/",
+      domain: "v.redd.it",
+      url: "https://v.redd.it/xyz789",
+      is_video: true,
+      media: {
+        reddit_video: {
+          hls_url: "https://example.com/video.m3u8",
+          fallback_url: "https://v.redd.it/xyz789/DASH_720.mp4?source=fallback",
+          dash_url: "https://example.com/video.mpd",
+          width: 720,
+          height: 1280,
+          duration: 30,
+        },
+      },
+    };
+    const result = processRedditContentFn(data);
+    // Must reflect the post's actual max rung (720 here), not a hardcoded
+    // DASH_1080 that would 404, and query params must be stripped.
+    expect(result.source).toBe("https://v.redd.it/xyz789/DASH_720.mp4");
+  });
+
   it("processes RedGifs content via processRedditContent", () => {
     const data = {
       title: "Redgifs Test",

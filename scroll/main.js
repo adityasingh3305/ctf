@@ -807,8 +807,10 @@ function processRedditContent(data) {
   if (data.domain === "v.redd.it" || (data.is_video && data.media?.reddit_video)) {
     const redditVideo = data.media?.reddit_video;
     if (!redditVideo) return { type: "invalid", source: "", hlsSource: "", width: 0, height: 0 };
-    const dashId = redditVideo.fallback_url.split("/")[3];
-    const bestSource = `https://v.redd.it/${dashId}/DASH_1080.mp4`;
+    // Reddit's fallback_url already points at the highest DASH mp4 rung the
+    // post actually has (e.g. DASH_1080/DASH_720/DASH_480). Use it directly so
+    // we never request a non-existent 1080 variant (which 404s). Strip query.
+    const bestSource = (redditVideo.fallback_url || "").split("?")[0] || redditVideo.fallback_url;
     return {
       type: "video",
       source: bestSource,
@@ -1517,14 +1519,25 @@ class RedditScroller {
     return 0;
   }
 
+  pauseInactiveReelVideos(activeVideo = null) {
+    this.app.querySelectorAll(".reel-video-player video").forEach((video) => {
+      if (video !== activeVideo) {
+        video.pause();
+        video.muted = true;
+      }
+    });
+  }
+
   setupObservers() {
     this.videoObserver = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
           const video = entry.target;
-          if (entry.isIntersecting) {
+          const shouldPlay = entry.isIntersecting && entry.intersectionRatio >= 0.6;
+          if (shouldPlay) {
             // Grid videos only play on hover — don't autoplay here
             if (video.dataset.grid) return;
+            this.pauseInactiveReelVideos(video);
             video.muted = !this.audioUnlocked;
             video.play().catch(() => {
               if (!this.audioUnlocked) {
@@ -1537,7 +1550,7 @@ class RedditScroller {
           }
         });
       },
-      { threshold: 0.6 }
+      { threshold: 0.5 }
     );
 
     this.gridSentinelObserver = new IntersectionObserver(
@@ -1656,6 +1669,21 @@ class RedditScroller {
         });
         ticking = true;
       }
+    });
+
+    let reelTicking = false;
+    this.app.addEventListener("scroll", () => {
+      if (!this.reelMode || reelTicking) return;
+      window.requestAnimationFrame(() => {
+        const currentIndex = this.getCurrentReelIndex();
+        const cards = this.app.querySelectorAll(".post-card");
+        if (currentIndex >= 0 && cards[currentIndex]) {
+          const currentVideo = cards[currentIndex].querySelector("video");
+          this.pauseInactiveReelVideos(currentVideo);
+        }
+        reelTicking = false;
+      });
+      reelTicking = true;
     });
 
     // ── Comment sheet: close on outside click ──
@@ -2072,6 +2100,7 @@ class RedditScroller {
         const rvp = new ReelVideoPlayer(video);
         video._rvp = rvp;
         this.videoObserver.observe(video);
+        video.addEventListener("play", () => this.pauseInactiveReelVideos(video));
         const hlsSrc = processed.hlsSource || "";
         if (hlsSrc) {
           this.initHls(video, hlsSrc, video.dataset.fallback || "");
@@ -2447,16 +2476,29 @@ class RedditScroller {
       enableWorker: true,
       lowLatencyMode: true,
       startFragPrefetch: true,
-      capLevelToPlayerSize: true,
+      // Always play the highest available rendition (HD every time).
+      // Do NOT cap to the rendered element size — that forces low quality
+      // on small grid thumbnails.
+      capLevelToPlayerSize: false,
+      startLevel: -1,
       maxBufferLength: 15,
       maxMaxBufferLength: 30,
       backBufferLength: 5,
-      abrEwmaDefaultEstimate: 500000,
+      // High default bandwidth estimate so ABR never starts on a low rung.
+      abrEwmaDefaultEstimate: 5000000,
     });
     // Attach first, then load source once media is ready (ScrollX pattern)
     hls.attachMedia(video);
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
       hls.loadSource(hlsUrl);
+    });
+    // Pin to the highest-quality rendition as soon as the manifest is known.
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (hls.levels && hls.levels.length) {
+        const topLevel = hls.levels.length - 1;
+        hls.startLevel = topLevel;
+        hls.currentLevel = topLevel;
+      }
     });
     hls.on(Hls.Events.ERROR, (_, d) => {
       if (!d.fatal) return;
