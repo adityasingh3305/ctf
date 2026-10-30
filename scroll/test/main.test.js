@@ -177,6 +177,36 @@ describe("RedditScroller utility methods", () => {
     expect(result.source).toBe("https://media.redgifs.com/xyz123-mobile.mp4");
   });
 
+  it("prefers reddit_video_preview for RedGifs even when hasAudio is false", () => {
+    const data = {
+      title: "Redgifs Test",
+      permalink: "/r/gifs/comments/456/test_gif/",
+      domain: "redgifs.com",
+      url: "https://redgifs.com/watch/xyz123",
+      hasAudio: false,
+      preview: {
+        reddit_video_preview: {
+          fallback_url: "https://v.redd.it/abc123/DASH_720.mp4",
+          hls_url: "https://v.redd.it/abc123/HLSPlaylist.m3u8",
+          width: 640,
+          height: 480,
+        },
+      },
+      media: {
+        oembed: {
+          thumbnail_url: "https://media.redgifs.com/xyz123-poster.jpg",
+          width: 640,
+          height: 480,
+        },
+      },
+    };
+    const result = processRedditContentFn(data);
+    expect(result).toBeTruthy();
+    expect(result.type).toBe("video");
+    expect(result.source).toBe("https://v.redd.it/abc123/DASH_720.mp4");
+    expect(result.hlsSource).toBe("https://v.redd.it/abc123/HLSPlaylist.m3u8");
+  });
+
   it("processes image content via processRedditContent", () => {
     const data = {
       title: "Test Image",

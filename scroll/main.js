@@ -371,6 +371,7 @@ class RedditAPI {
           url: c.data.url,
           subscribers: c.data.subscribers,
           description: c.data.public_description || c.data.description || "",
+          icon: c.data.community_icon || c.data.icon_img || "",
           isNSFW: c.data.over18,
         }));
       if (filter === "sfw") results = results.filter((r) => !r.isNSFW);
@@ -394,6 +395,7 @@ class RedditAPI {
           url: c.data.url,
           subscribers: c.data.subscribers,
           description: c.data.public_description || c.data.description || "",
+          icon: c.data.community_icon || c.data.icon_img || "",
           isNSFW: c.data.over18,
         }));
       if (filter === "sfw") results = results.filter((r) => !r.isNSFW);
@@ -505,7 +507,7 @@ class RedditDataSource extends AbstractDataQueue {
   async fetchAndTransformPosts(subreddits, sort, after = "") {
     const { posts, afterToken } = await this.api.fetchCombinedPosts(subreddits, sort, after);
     return {
-      posts: posts.map((p) => this.transformToUnifiedPost(p)).filter(Boolean),
+      posts: await this.processPosts(posts),
       afterToken,
     };
   }
@@ -518,8 +520,55 @@ class RedditDataSource extends AbstractDataQueue {
     });
   }
 
-  processPosts(posts) {
-    const processed = posts.map((p) => this.transformToUnifiedPost(p)).filter(Boolean);
+  async augmentPosts(posts) {
+    let token = this.redgifsToken;
+    let tokenExpires = this.redgifsTokenExpires || 0;
+    
+    const needsRedgifs = posts.some(p => p.domain?.includes("redgifs"));
+    if (needsRedgifs && (!token || Date.now() > tokenExpires)) {
+      try {
+        const res = await fetch("https://api.redgifs.com/v2/auth/temporary");
+        if (res.ok) {
+          const auth = await res.json();
+          token = auth.token;
+          this.redgifsToken = token;
+          this.redgifsTokenExpires = Date.now() + (1000 * 60 * 60 * 12);
+        }
+      } catch (e) {
+        console.error("Redgifs auth failed", e);
+      }
+    }
+
+    return await Promise.all(
+      posts.map(async (p) => {
+        if (token && p.domain?.includes("redgifs")) {
+          let id = null;
+          if (p.media?.oembed?.thumbnail_url) id = extractRedgifsId(p.media.oembed.thumbnail_url);
+          else if (p.url) id = extractRedgifsId(p.url);
+          
+          if (id) {
+            try {
+              const res = await fetch(`https://api.redgifs.com/v2/gifs/${id}`, {
+                headers: { "Authorization": `Bearer ${token}` }
+              });
+              if (res.ok) {
+                const data = await res.json();
+                if (data.gif?.urls?.hd) p.resolvedRedgifsUrl = data.gif.urls.hd;
+                else if (data.gif?.urls?.sd) p.resolvedRedgifsUrl = data.gif.urls.sd;
+              }
+            } catch (e) {
+              console.error("Redgifs resolution failed for", id, e);
+            }
+          }
+        }
+        return p;
+      })
+    );
+  }
+
+  async processPosts(posts) {
+    const augmentedPosts = await this.augmentPosts(posts);
+    const processed = augmentedPosts.map((p) => this.transformToUnifiedPost(p)).filter(Boolean);
     if (!processed.length) return [];
     return processed;
   }
@@ -532,7 +581,7 @@ class RedditDataSource extends AbstractDataQueue {
       this.afterTokens[this.currentUser] || ""
     );
     this.afterTokens[this.currentUser] = afterToken;
-    const processed = this.processPosts(posts);
+    const processed = await this.processPosts(posts);
     return { posts: RedditDataSource.deduplicatePosts(processed), afterToken };
   }
 
@@ -578,7 +627,7 @@ class RedditDataSource extends AbstractDataQueue {
       console.error("[RedditDataSource] fetchMoreData failed:", e);
       return { posts: [], hasMore: false };
     }
-    const processed = this.processPosts(posts);
+    const processed = await this.processPosts(posts);
     return { posts: RedditDataSource.deduplicatePosts(processed), hasMore };
   }
 
@@ -843,17 +892,35 @@ function processRedditContent(data) {
 
   // Redgifs
   if (data.domain?.includes("redgifs")) {
-    if (data.preview?.reddit_video_preview && data.hasAudio) {
+    const hasAudio = data.has_audio || data.preview?.reddit_video_preview?.has_audio || false;
+    
+    if (data.resolvedRedgifsUrl) {
       return {
         type: "video",
-        source: data.preview.reddit_video_preview.fallback_url,
-        hlsSource: data.preview.reddit_video_preview.hls_url,
+        source: data.resolvedRedgifsUrl,
+        sources: [
+          { src: data.resolvedRedgifsUrl, type: "video/mp4" },
+          { src: data.preview?.reddit_video_preview?.fallback_url?.replace(/&amp;/g, "&"), type: "video/mp4" }
+        ].filter(s => s.src),
+        width: data.media?.oembed?.width || data.preview?.reddit_video_preview?.width || 0,
+        height: data.media?.oembed?.height || data.preview?.reddit_video_preview?.height || 0,
+        permalink: `https://www.reddit.com${data.permalink}`,
+        poster: getPreviewPoster(data) || (data.media?.oembed?.thumbnail_url ? `https://media.redgifs.com/${extractRedgifsId(data.media.oembed.thumbnail_url)}-mobile.jpg` : ""),
+      };
+    }
+
+    if (data.preview?.reddit_video_preview && hasAudio) {
+      return {
+        type: "video",
+        source: data.preview.reddit_video_preview.fallback_url?.replace(/&amp;/g, "&"),
+        hlsSource: data.preview.reddit_video_preview.hls_url?.replace(/&amp;/g, "&"),
         width: data.preview.reddit_video_preview.width,
         height: data.preview.reddit_video_preview.height,
         permalink: `https://www.reddit.com${data.permalink}`,
         poster: getPreviewPoster(data),
       };
     }
+    
     if (data.media?.oembed) {
       const id = extractRedgifsId(data.media.oembed.thumbnail_url);
       if (id) {
@@ -862,8 +929,8 @@ function processRedditContent(data) {
           source: `https://media.redgifs.com/${id}-mobile.mp4`,
           sources: [
             { src: `https://media.redgifs.com/${id}-mobile.mp4`, type: "video/mp4" },
-            { src: data.preview?.reddit_video_preview?.fallback_url, type: "video/mp4" },
-          ],
+            { src: data.preview?.reddit_video_preview?.fallback_url?.replace(/&amp;/g, "&"), type: "video/mp4" },
+          ].filter(s => s.src),
           permalink,
           poster: getPreviewPoster(data) || `https://media.redgifs.com/${id}-mobile.jpg`,
           width: data.media.oembed.width,
@@ -872,9 +939,9 @@ function processRedditContent(data) {
       }
       return {
         type: "video",
-        source: data.preview?.reddit_video_preview?.fallback_url,
-        hlsSource: data.preview?.reddit_video_preview?.hls_url,
-        sources: [{ src: data.preview?.reddit_video_preview?.fallback_url, type: "video/mp4" }],
+        source: data.preview?.reddit_video_preview?.fallback_url?.replace(/&amp;/g, "&"),
+        hlsSource: data.preview?.reddit_video_preview?.hls_url?.replace(/&amp;/g, "&"),
+        sources: [{ src: data.preview?.reddit_video_preview?.fallback_url?.replace(/&amp;/g, "&"), type: "video/mp4" }].filter(s => s.src),
         poster: getPreviewPoster(data),
         permalink,
         width: data.media.oembed.width,
@@ -1533,16 +1600,14 @@ class RedditScroller {
       (entries) => {
         entries.forEach((entry) => {
           const video = entry.target;
-          const shouldPlay = entry.isIntersecting && entry.intersectionRatio >= 0.6;
+          const shouldPlay = entry.intersectionRatio >= 0.5;
           if (shouldPlay) {
             // Grid videos only play on hover — don't autoplay here
             if (video.dataset.grid) return;
             this.pauseInactiveReelVideos(video);
-            video.muted = !this.audioUnlocked;
+            video.muted = false;
             video.play().catch(() => {
-              if (!this.audioUnlocked) {
-                video.muted = true;
-              }
+              video.muted = true;
               video.play().catch(() => {});
             });
           } else {
@@ -1550,7 +1615,7 @@ class RedditScroller {
           }
         });
       },
-      { threshold: 0.5 }
+      { threshold: [0, 0.25, 0.5, 0.75, 1] }
     );
 
     this.gridSentinelObserver = new IntersectionObserver(
@@ -1575,6 +1640,33 @@ class RedditScroller {
   }
 
   setupEventListeners() {
+    window.addEventListener("popstate", (e) => {
+      const view = e.state ? e.state.view : null;
+      if (!view) {
+        if (this.commentSheet.classList.contains("active")) {
+          this.toggleComments(false, true);
+        }
+        if (this.reelMode) {
+          this.closeReel(true);
+        }
+      } else if (view === "reel") {
+        if (this.commentSheet.classList.contains("active")) {
+          this.toggleComments(false, true);
+        }
+        if (!this.reelMode) {
+          history.back();
+        }
+      } else if (view === "comments") {
+        if (this.reelMode && !this.commentSheet.classList.contains("active")) {
+          if (this._currentCommentData) {
+            this.toggleComments(true, true);
+          } else {
+            history.back();
+          }
+        }
+      }
+    });
+
     document.getElementById("closeReel").addEventListener("click", () => this.closeReel());
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && this.reelMode) {
@@ -1712,6 +1804,7 @@ class RedditScroller {
   }
 
   openReel(startIndex) {
+    history.pushState({ view: 'reel' }, '', '#reel');
     this.reelMode = true;
     this.audioUnlocked = true;
     this.app.innerHTML = "";
@@ -1721,10 +1814,15 @@ class RedditScroller {
     this.app.scrollTop = 0;
   }
 
-  closeReel() {
+  closeReel(fromHistory = false) {
+    if (!this.reelMode) return;
+    if (!fromHistory) {
+      history.back();
+      return;
+    }
     this.reelMode = false;
     this.reelView.classList.remove("active");
-    this.toggleComments(false);
+    this.toggleComments(false, true);
     document.body.style.overflow = "";
     document.querySelectorAll("#app video").forEach((v) => {
       if (v._rvp) v._rvp.destroy();
@@ -1768,12 +1866,12 @@ class RedditScroller {
         this.suggestions.style.display = "none";
         return;
       }
-      const data = await this.api.fetchSuggestions(q);
-      const subs = data.data.children.filter((c) => c.kind === "t5");
-      if (subs.length) this.renderSuggestions(subs);
+      const subs = await this.api.searchSubreddits(q);
+      if (subs && subs.length) this.renderSuggestions(subs);
       else this.suggestions.style.display = "none";
     } catch (e) {
       console.error(e);
+      this.suggestions.style.display = "none";
     }
   }
 
@@ -1781,11 +1879,11 @@ class RedditScroller {
     this.suggestions.innerHTML = subs
       .map(
         (sub) => `
-      <div class="suggestion-item" data-name="${sub.data.display_name}">
-        <div class="suggestion-icon" style="background-image:url(${sub.data.community_icon || sub.data.icon_img || ""}); background-size:cover;"></div>
+      <div class="suggestion-item" data-name="${sub.name}">
+        <div class="suggestion-icon" style="background-image:url(${sub.icon}); background-size:cover;"></div>
         <div>
-          <span style="font-weight:600;">r/${sub.data.display_name}</span>
-          <span style="font-size:0.75rem;color:#aaa;display:block;">${(sub.data.subscribers || 0).toLocaleString()} members</span>
+          <span style="font-weight:600;">r/${sub.name}</span>
+          <span style="font-size:0.75rem;color:#aaa;display:block;">${(sub.subscribers || 0).toLocaleString()} members</span>
         </div>
       </div>`
       )
@@ -1818,7 +1916,6 @@ class RedditScroller {
       this.dataSource.resetPagination();
     }
     this.buildColumns();
-    if (this.reelMode) this.closeReel();
   }
 
   async fetchPosts(appendToReel = false) {
@@ -2225,29 +2322,46 @@ class RedditScroller {
   }
 
   renderCommentTree(comments, depth = 0) {
+    // Depth color palette matching Reddit's rainbow thread lines
+    const depthColors = [
+      '#22c55e', // green
+      '#3b82f6', // blue
+      '#eab308', // yellow
+      '#ef4444', // red
+      '#a855f7', // purple
+      '#ec4899', // pink
+      '#f97316', // orange
+    ];
     return comments
       .filter((c) => c.body || c.body === "")
       .map((c) => {
         const isDeleted = c.author === "[deleted]" || c.author === "[removed]";
         const authorClass = c.author === "[deleted]" ? "author-deleted" : c.author === "[removed]" ? "author-removed" : "";
-        const isCollapsed = depth >= 3;
+        const isOP = this._currentCommentData && c.author === this._currentCommentData.author && !isDeleted;
+        const color = depthColors[depth % depthColors.length];
         const hasReplies = c.replies && c.replies.data && (
           c.replies.data.children.some((r) => r.kind === "t1") ||
           c.replies.data.children.some((r) => r.kind === "more")
         );
-        return `
-      <div class="comment-item ${depth > 0 ? "comment-reply" : ""}${isCollapsed ? " collapsed" : ""}" data-depth="${Math.min(depth, 6)}">
-        <div class="comment-header-row">
-          <span class="comment-author ${authorClass}">${isDeleted ? c.author : `u/${c.author}`}</span>
-          ${c.stickied ? '<span class="pinned-badge"><i class="bi bi-pin-fill"></i> Pinned</span>' : ""}
-          <span class="comment-score"><i class="bi bi-arrow-up-short"></i>${this.formatNumber(c.score || 0)}</span>
-          ${c.created_utc ? `<span class="comment-time">${this.formatTimeAgo(c.created_utc)}</span>` : ""}
-          ${hasReplies ? '<i class="bi bi-chevron-down comment-collapse-toggle"></i>' : ""}
-        </div>
-        <div class="comment-body">${this.parseMarkdown(c.body || "")}</div>
-        ${c.replies && c.replies.data
+        const repliesHtml = c.replies && c.replies.data
           ? this.renderCommentReplies(c.replies.data.children, depth + 1)
-          : ""}
+          : "";
+
+        return `
+      <div class="comment-thread${depth === 0 ? ' comment-top-level' : ''}" data-depth="${Math.min(depth, 6)}">
+        ${depth > 0 ? `<div class="comment-thread-line" style="--thread-color: ${color}" title="Collapse thread"></div>` : ''}
+        <div class="comment-thread-content">
+          <div class="comment-header-row">
+            <button class="comment-author ${authorClass}" onclick="event.stopPropagation(); window.scroller && !${isDeleted} && window.scroller.navigateToUser('${c.author}')" title="View u/${c.author}'s posts">${isDeleted ? c.author : `u/${c.author}`}</button>
+            ${isOP ? '<span class="comment-op-badge">OP</span>' : ''}
+            ${c.stickied ? '<span class="pinned-badge"><i class="bi bi-pin-fill"></i> Pinned</span>' : ""}
+            <span class="comment-score"><i class="bi bi-arrow-up-short"></i>${this.formatNumber(c.score || 0)}</span>
+            ${c.created_utc ? `<span class="comment-time">${this.formatTimeAgo(c.created_utc)}</span>` : ""}
+            ${hasReplies ? '<i class="bi bi-chevron-down comment-collapse-toggle"></i>' : ""}
+          </div>
+          <div class="comment-body">${this.parseMarkdown(c.body || "")}</div>
+          ${repliesHtml}
+        </div>
       </div>
     `;
       })
@@ -2365,27 +2479,35 @@ class RedditScroller {
   }
 
   attachCollapseHandlers(container) {
-    container.querySelectorAll(".comment-header-row").forEach((row) => {
-      const toggle = row.querySelector(".comment-collapse-toggle");
-      if (!toggle) {
-        const item = row.closest(".comment-item");
-        const hasReplies = item && item.querySelector(":scope > .comment-replies");
-        if (hasReplies) {
-          row.style.cursor = "pointer";
-          row.addEventListener("click", (e) => {
-            e.stopPropagation();
-            item.classList.toggle("collapsed");
-          });
+    // Clicking the vertical thread line collapses
+    container.querySelectorAll(".comment-thread-line").forEach((line) => {
+      line.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const thread = line.closest(".comment-thread");
+        if (thread) {
+          thread.classList.toggle("collapsed");
+          const toggle = thread.querySelector(":scope > .comment-thread-content > .comment-header-row .comment-collapse-toggle");
+          if (toggle) {
+            toggle.classList.toggle("bi-chevron-down");
+            toggle.classList.toggle("bi-chevron-right");
+          }
         }
-        return;
-      }
+      });
+    });
+
+    // Clicking the header row also collapses
+    container.querySelectorAll(".comment-header-row").forEach((row) => {
       row.style.cursor = "pointer";
       row.addEventListener("click", (e) => {
         e.stopPropagation();
-        const item = row.closest(".comment-item");
-        item.classList.toggle("collapsed");
-        toggle.classList.toggle("bi-chevron-down");
-        toggle.classList.toggle("bi-chevron-right");
+        const thread = row.closest(".comment-thread");
+        if (!thread) return;
+        thread.classList.toggle("collapsed");
+        const toggle = row.querySelector(".comment-collapse-toggle");
+        if (toggle) {
+          toggle.classList.toggle("bi-chevron-down");
+          toggle.classList.toggle("bi-chevron-right");
+        }
       });
     });
   }
@@ -2405,9 +2527,21 @@ class RedditScroller {
     return `${Math.floor(months / 12)}y`;
   }
 
-  toggleComments(show) {
-    if (show) this.commentSheet.classList.add("active");
-    else this.commentSheet.classList.remove("active");
+  toggleComments(show, fromHistory = false) {
+    if (show) {
+      if (!this.commentSheet.classList.contains("active")) {
+        if (!fromHistory) history.pushState({ view: 'comments' }, '', '#comments');
+        this.commentSheet.classList.add("active");
+      }
+    } else {
+      if (this.commentSheet.classList.contains("active")) {
+        if (!fromHistory) {
+          history.back();
+          return;
+        }
+        this.commentSheet.classList.remove("active");
+      }
+    }
   }
 
   parseMarkdown(text) {
@@ -2438,17 +2572,58 @@ class RedditScroller {
     // Italic *text*
     html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
 
+    // Image Markdown ![alt](url)
+    html = html.replace(
+      /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+      (match, alt, url) => {
+        const cleanUrl = url.replace(/&amp;/g, "&");
+        return `<img src="${cleanUrl}" alt="${alt || 'image'}" class="comment-image" loading="lazy" />`;
+      }
+    );
+
     // Links [text](url)
     html = html.replace(
-      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+      /\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+      (match, text, url) => {
+        const isImage = url.match(/\.(jpeg|jpg|gif|png|webp)(\?.*)?$/i) || url.includes("preview.redd.it") || url.includes("i.redd.it") || url.includes("giphy.com/media/");
+        if (isImage) {
+          const cleanUrl = url.replace(/&amp;/g, "&");
+          return `<img src="${cleanUrl}" alt="${text || 'image'}" class="comment-image" loading="lazy" />`;
+        }
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+      }
+    );
+
+    // Auto-link bare URLs that are not already in href=" or src="
+    // using a regex that checks the preceding character is not "=" or "'" or '"'
+    html = html.replace(
+      /(^|[^"'])\b(https?:\/\/[^\s<]+)/g,
+      (match, prefix, url) => {
+        let cleanUrl = url;
+        let suffix = "";
+        const matchPunctuation = url.match(/([.,!?:;)]+)$/);
+        if (matchPunctuation) {
+          cleanUrl = url.slice(0, -matchPunctuation[1].length);
+          suffix = matchPunctuation[1];
+        }
+        const isImage = cleanUrl.match(/\.(jpeg|jpg|gif|png|webp)(\?.*)?$/i) || cleanUrl.includes("preview.redd.it") || cleanUrl.includes("i.redd.it") || cleanUrl.includes("giphy.com/media/");
+        if (isImage) {
+          const srcUrl = cleanUrl.replace(/&amp;/g, "&");
+          return `${prefix}<img src="${srcUrl}" alt="image" class="comment-image" loading="lazy" />${suffix}`;
+        }
+        return `${prefix}<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${cleanUrl}</a>${suffix}`;
+      }
     );
 
     // Step 4: Reddit-specific auto-linking
-    // r/subreddit links
-    html = html.replace(/(^|\s)(r\/[a-zA-Z0-9_]+)/g, '$1<a href="https://reddit.com/$2" target="_blank" rel="noopener noreferrer">$2</a>');
-    // u/username links
-    html = html.replace(/(^|\s)(u\/[a-zA-Z0-9_-]+)/g, '$1<a href="https://reddit.com/$2" target="_blank" rel="noopener noreferrer">$2</a>');
+    // r/subreddit links — open in-app
+    html = html.replace(/(^|[^a-zA-Z0-9/])(r\/[a-zA-Z0-9_]+)/g, (m, pre, sub) =>
+      `${pre}<a href="#" class="comment-internal-link" onclick="event.preventDefault(); window.scroller && window.scroller.navigateToSubreddit('${sub.replace('r/', '')}')">${sub}</a>`
+    );
+    // u/username links — open in-app
+    html = html.replace(/(^|[^a-zA-Z0-9/])(u\/[a-zA-Z0-9_-]+)/g, (m, pre, user) =>
+      `${pre}<a href="#" class="comment-internal-link" onclick="event.preventDefault(); window.scroller && window.scroller.navigateToUser('${user.replace('u/', '')}')">${user}</a>`
+    );
 
     // Step 5: Blockquotes (lines starting with >)
     html = html.replace(/^&gt;\s?(.*)$/gm, "<blockquote>$1</blockquote>");
@@ -2519,6 +2694,13 @@ class RedditScroller {
   }
 
   navigateToSubreddit(sub) {
+    // Close comments + reel first, then load
+    if (this.commentSheet.classList.contains("active")) {
+      this.toggleComments(false, true);
+    }
+    if (this.reelMode) {
+      this.closeReel(true);
+    }
     this.searchInput.value = sub;
     this.currentSubreddit = sub;
     this.resetFeed();
@@ -2526,6 +2708,13 @@ class RedditScroller {
   }
 
   navigateToUser(username) {
+    // Close comments + reel first, then load
+    if (this.commentSheet.classList.contains("active")) {
+      this.toggleComments(false, true);
+    }
+    if (this.reelMode) {
+      this.closeReel(true);
+    }
     this.searchInput.value = `u/${username}`;
     this.currentSubreddit = `u/${username}`;
     this.resetFeed();
